@@ -1,0 +1,12 @@
+# Virtual environments
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Local secrets & API keys
+.env
+
+# Local DuckDB lock/temporary files
+data/*.wal
+data/*.tmp
