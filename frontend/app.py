@@ -20,11 +20,45 @@ st.title("⚡ Port Operations & SLA Intelligence Engine")
 st.caption("Deterministic DuckDB Columnar Telemetry + Groq LPU Root Cause Attribution")
 
 # --- Sidebar Controls ---
+st.sidebar.header("📁 Data Source & Ingestion")
+uploaded_file = st.sidebar.file_uploader(
+    "Upload Custom Operational Telemetry (CSV or Excel)",
+    type=["csv", "xlsx"]
+)
+
+# Connect to DuckDB (in-memory for uploads, or file for default seed)
+conn = duckdb.connect()
+
+if uploaded_file is not None:
+    # 1. Parse custom uploaded file
+    if uploaded_file.name.endswith(".csv"):
+        df_uploaded = pd.read_csv(uploaded_file)
+    else:
+        df_uploaded = pd.read_excel(uploaded_file)
+
+    conn.register("metrics", df_uploaded)
+    st.sidebar.success(f"Loaded {len(df_uploaded)} rows from `{uploaded_file.name}`")
+
+    # Dynamically extract filter choices from uploaded columns
+    region_options = sorted(df_uploaded["region"].dropna().unique().tolist()) if "region" in df_uploaded.columns else ["Default"]
+    quarter_options = sorted(df_uploaded["quarter"].dropna().unique().tolist()) if "quarter" in df_uploaded.columns else ["Default"]
+    metric_options = sorted(df_uploaded["metric_name"].dropna().unique().tolist()) if "metric_name" in df_uploaded.columns else ["Default"]
+else:
+    # 2. Fall back to local seeded DuckDB
+    if os.path.exists("data/supply_chain.duckdb"):
+        conn.execute("ATTACH 'data/supply_chain.duckdb' AS db (READ_ONLY);")
+        conn.execute("USE db;")
+    
+    region_options = ["Jebel_Ali", "Singapore", "Rotterdam"]
+    quarter_options = ["2026-Q3", "2026-Q4"]
+    metric_options = ["Port_SLA", "Berth_Turnaround", "Gate_Throughput"]
+
 st.sidebar.header("Incident Parameters")
-region = st.sidebar.selectbox("Region / Port", ["Jebel_Ali", "Singapore", "Rotterdam"])
-quarter = st.sidebar.selectbox("Quarter", ["2026-Q3", "2026-Q4"])
-metric_name = st.sidebar.selectbox("Observed Metric", ["Port_SLA", "Berth_Turnaround", "Gate_Throughput"])
+region = st.sidebar.selectbox("Region / Port", region_options)
+quarter = st.sidebar.selectbox("Quarter", quarter_options)
+metric_name = st.sidebar.selectbox("Observed Metric", metric_options)
 drop_pct = st.sidebar.slider("Observed SLA Drop (%)", min_value=-50.0, max_value=-1.0, value=-18.5, step=0.5)
+
 run_button = st.sidebar.button("Run Diagnostic Analysis", type="primary")
 
 # --- Main Dashboard ---
@@ -33,7 +67,7 @@ if run_button:
         st.error("GROQ_API_KEY is not configured in Secrets. Add it under App Settings -> Secrets.")
     else:
         with st.spinner("Executing DuckDB columnar query & Groq reasoning..."):
-            # 1. Deterministic DuckDB SQL Execution & Timing
+            # 1. Deterministic SQL Execution
             sql_query = (
                 f"SELECT fulfillment_delay_hours, financial_impact_usd "
                 f"FROM metrics "
@@ -41,18 +75,22 @@ if run_button:
             )
 
             sql_start = time.perf_counter()
-            conn = duckdb.connect("data/supply_chain.duckdb", read_only=True)
-            row = conn.execute(
-                "SELECT fulfillment_delay_hours, financial_impact_usd FROM metrics WHERE region = ? AND quarter = ?",
-                [region, quarter]
-            ).fetchone()
-            conn.close()
+            try:
+                row = conn.execute(
+                    "SELECT fulfillment_delay_hours, financial_impact_usd FROM metrics WHERE region = ? AND quarter = ?",
+                    [region, quarter]
+                ).fetchone()
+            except Exception as e:
+                row = None
+                st.warning(f"Query note: Ensure uploaded table has 'fulfillment_delay_hours' and 'financial_impact_usd' columns. ({e})")
+
             sql_latency_ms = round((time.perf_counter() - sql_start) * 1000, 2)
+            conn.close()
 
             delay = row[0] if row else 0.0
             impact = row[1] if row else 0.0
 
-            # 2. AI Reasoning via Groq & Timing
+            # 2. AI Reasoning via Groq
             prompt = f"""
             You are an expert Chief Operating Officer analyzing port supply chain telemetry.
             Region: {region}
@@ -78,7 +116,7 @@ if run_button:
 
             data = json.loads(chat_completion.choices[0].message.content)
 
-            # --- Visual Section 1: KPI Cards ---
+            # 3. KPI Overview Cards
             col1, col2, col3 = st.columns(3)
             col1.metric("Observed Delay", f"{delay} hrs")
             col2.metric("Financial Impact", f"${impact:,.2f}")
@@ -86,7 +124,7 @@ if run_button:
 
             st.divider()
 
-            # --- Visual Section 2: Diagnostic Attribution ---
+            # 4. Diagnostic Panels
             c1, c2 = st.columns(2)
             with c1:
                 st.subheader("🔍 Primary Root Cause")
@@ -97,7 +135,7 @@ if run_button:
 
             st.divider()
 
-            # --- Visual Section 3: Interactive Bar Chart ---
+            # 5. Visual Chart Benchmark
             st.subheader("📈 Operational Impact Benchmark")
             chart_data = pd.DataFrame({
                 "Operational Metric": ["Operational Delay (hrs)", "Financial Impact ($K)"],
@@ -105,7 +143,7 @@ if run_button:
             }).set_index("Operational Metric")
             st.bar_chart(chart_data)
 
-            # --- Visual Section 4: Telemetry & Audit Expander ---
+            # 6. Audit & Explainability Expander
             with st.expander("🛠️ Execution Trace & Telemetry Audit", expanded=True):
                 t1, t2, t3 = st.columns(3)
                 t1.metric("DuckDB Query Latency", f"{sql_latency_ms} ms")
@@ -116,7 +154,7 @@ if run_button:
                 st.code(sql_query, language="sql")
 
                 st.markdown("**Raw API JSON Output:**")
-                raw_debug = {
+                st.json({
                     "region": region,
                     "quarter": quarter,
                     "metric_name": metric_name,
@@ -130,7 +168,6 @@ if run_button:
                         "llm_latency_ms": llm_latency_ms,
                         "model_used": "openai/gpt-oss-120b"
                     }
-                }
-                st.json(raw_debug)
+                })
 else:
-    st.info("Select parameters in the sidebar and click **Run Diagnostic Analysis** to generate operational insights.")
+    st.info("Select parameters or upload a custom CSV/Excel file in the sidebar, then click **Run Diagnostic Analysis**.")
